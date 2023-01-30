@@ -66,7 +66,7 @@ where
 {
     let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::wide_ecc_config());
     let mut pw = PartialWitness::new();
-    let repeat_times = 2;
+    let repeat_times = 1;
     for _ in 0..repeat_times {
         let targets = make_verify_circuits(&mut builder, msg.len());
         fill_circuits::<F, D>(&mut pw, msg, sigv, pkv, &targets);    
@@ -85,6 +85,8 @@ where
     let timing = TimingTree::new("verify", Level::Info);
     data.verify(proof.clone()).expect("verify error");
     timing.print();
+
+    println!("proof size {}", proof.to_bytes().len());
 
     Ok(())
 }
