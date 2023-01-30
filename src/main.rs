@@ -4,223 +4,21 @@
 use anyhow::Result;
 use clap::Parser;
 use core::num::ParseIntError;
-use log::{info, Level, LevelFilter};
-use plonky2::gates::noop::NoopGate;
+use log::{Level, LevelFilter};
 use plonky2::hash::hash_types::RichField;
-use plonky2::iop::witness::{PartialWitness, WitnessWrite};
+use plonky2::iop::witness::{PartialWitness};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{
-    CircuitConfig, CommonCircuitData, VerifierCircuitTarget, VerifierOnlyCircuitData,
+    CircuitConfig
 };
-use plonky2::plonk::config::{AlgebraicHasher, GenericConfig, Hasher, PoseidonGoldilocksConfig};
-use plonky2::plonk::proof::{CompressedProofWithPublicInputs, ProofWithPublicInputs};
-use plonky2::plonk::prover::prove;
-use plonky2::recursion::tree_recursion::{
-    check_tree_proof_verifier_data, common_data_for_recursion, set_tree_recursion_leaf_data_target,
-    TreeRecursionLeafData,
-};
+use plonky2::plonk::config::{GenericConfig, Hasher, PoseidonGoldilocksConfig};
 use plonky2::util::timing::TimingTree;
 use plonky2_ed25519::curve::eddsa::{
-    SAMPLE_MSG1, SAMPLE_MSG2, SAMPLE_PK1, SAMPLE_SIG1, SAMPLE_SIG2,
+    SAMPLE_MSG1, SAMPLE_PK1, SAMPLE_SIG1,
 };
 use plonky2_ed25519::gadgets::eddsa::{fill_circuits, make_verify_circuits};
 use plonky2_field::extension::Extendable;
-use plonky2_field::goldilocks_field::GoldilocksField;
-use std::fs::File;
-use std::io::Write;
 use std::path::PathBuf;
-
-type ProofTuple<F, C, const D: usize> = (
-    ProofWithPublicInputs<F, C, D>,
-    VerifierOnlyCircuitData<C, D>,
-    CommonCircuitData<F, D>,
-);
-
-fn prove_ed25519<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    msg: &[u8],
-    sigv: &[u8],
-    pkv: &[u8],
-) -> Result<ProofTuple<F, C, D>>
-where
-    [(); C::Hasher::HASH_SIZE]:,
-{
-    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::wide_ecc_config());
-
-    let targets = make_verify_circuits(&mut builder, msg.len());
-    let mut pw = PartialWitness::new();
-    fill_circuits::<F, D>(&mut pw, msg, sigv, pkv, &targets);
-
-    println!(
-        "Constructing inner proof with {} gates",
-        builder.num_gates()
-    );
-    let data = builder.build::<C>();
-
-    let timing = TimingTree::new("prove", Level::Info);
-    let proof = data.prove(pw).unwrap();
-    timing.print();
-
-    let timing = TimingTree::new("verify", Level::Info);
-    data.verify(proof.clone()).expect("verify error");
-    timing.print();
-
-    // test_serialization(&proof, &data.verifier_only, &data.common)?;
-    Ok((proof, data.verifier_only, data.common))
-}
-
-fn recursive_proof<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    InnerC: GenericConfig<D, F = F>,
-    const D: usize,
->(
-    inner1: &ProofTuple<F, InnerC, D>,
-    inner2: Option<ProofTuple<F, InnerC, D>>,
-    config: &CircuitConfig,
-    min_degree_bits: Option<usize>,
-) -> Result<ProofTuple<F, C, D>>
-where
-    InnerC::Hasher: AlgebraicHasher<F>,
-    [(); C::Hasher::HASH_SIZE]:,
-{
-    let mut builder = CircuitBuilder::<F, D>::new(config.clone());
-    let mut pw = PartialWitness::new();
-
-    {
-        let (inner_proof, inner_vd, inner_cd) = inner1;
-        let pt = builder.add_virtual_proof_with_pis::<InnerC>(inner_cd);
-        pw.set_proof_with_pis_target(&pt, inner_proof);
-        builder.register_public_inputs(&*pt.public_inputs);
-
-        let inner_data = VerifierCircuitTarget {
-            constants_sigmas_cap: builder.add_virtual_cap(inner_cd.config.fri_config.cap_height),
-            circuit_digest: builder.add_virtual_hash(),
-        };
-        pw.set_cap_target(
-            &inner_data.constants_sigmas_cap,
-            &inner_vd.constants_sigmas_cap,
-        );
-        pw.set_hash_target(inner_data.circuit_digest, inner_vd.circuit_digest);
-
-        builder.verify_proof::<InnerC>(&pt, &inner_data, inner_cd);
-    }
-
-    if inner2.is_some() {
-        let (inner_proof, inner_vd, inner_cd) = inner2.unwrap();
-        let pt = builder.add_virtual_proof_with_pis::<InnerC>(&inner_cd);
-        pw.set_proof_with_pis_target(&pt, &inner_proof);
-        builder.register_public_inputs(&*pt.public_inputs);
-
-        let inner_data = VerifierCircuitTarget {
-            constants_sigmas_cap: builder.add_virtual_cap(inner_cd.config.fri_config.cap_height),
-            circuit_digest: builder.add_virtual_hash(),
-        };
-        pw.set_hash_target(inner_data.circuit_digest, inner_vd.circuit_digest);
-        pw.set_cap_target(
-            &inner_data.constants_sigmas_cap,
-            &inner_vd.constants_sigmas_cap,
-        );
-
-        builder.verify_proof::<InnerC>(&pt, &inner_data, &inner_cd);
-    }
-    builder.print_gate_counts(0);
-
-    if let Some(min_degree_bits) = min_degree_bits {
-        // We don't want to pad all the way up to 2^min_degree_bits, as the builder will
-        // add a few special gates afterward. So just pad to 2^(min_degree_bits
-        // - 1) + 1. Then the builder will pad to the next power of two,
-        // 2^min_degree_bits.
-        let min_gates = (1 << (min_degree_bits - 1)) + 1;
-        for _ in builder.num_gates()..min_gates {
-            builder.add_gate(NoopGate, vec![]);
-        }
-    }
-
-    let data = builder.build::<C>();
-
-    let mut timing = TimingTree::new("prove", Level::Info);
-    let proof = prove(&data.prover_only, &data.common, pw, &mut timing)?;
-    timing.print();
-
-    data.verify(proof.clone())?;
-
-    test_serialization(&proof, &data.verifier_only, &data.common)?;
-    Ok((proof, data.verifier_only, data.common))
-}
-
-fn benchmark() -> Result<()> {
-    const D: usize = 2;
-    type C = PoseidonGoldilocksConfig;
-    type F = <C as GenericConfig<D>>::F;
-    let config = CircuitConfig::standard_recursion_config();
-
-    let proof1 = prove_ed25519(
-        SAMPLE_MSG1.as_bytes(),
-        SAMPLE_SIG1.as_slice(),
-        SAMPLE_PK1.as_slice(),
-    )
-    .expect("prove error 1");
-    let proof2 = prove_ed25519(
-        SAMPLE_MSG2.as_bytes(),
-        SAMPLE_SIG2.as_slice(),
-        SAMPLE_PK1.as_slice(),
-    )
-    .expect("prove error 2");
-
-    // Recursively verify the proof
-    let middle = recursive_proof::<F, C, C, D>(&proof1, Some(proof2), &config, None)?;
-    let (_, _, cd) = &middle;
-    info!(
-        "Single recursion proof degree {} = 2^{}",
-        cd.degree(),
-        cd.degree_bits()
-    );
-
-    // Add a second layer of recursion to shrink the proof size further
-    let outer = recursive_proof::<F, C, C, D>(&middle, None, &config, None)?;
-    let (_, _, cd) = &outer;
-    info!(
-        "Double recursion proof degree {} = 2^{}",
-        cd.degree(),
-        cd.degree_bits()
-    );
-
-    Ok(())
-}
-
-/// Test serialization and print some size info.
-fn test_serialization<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    proof: &ProofWithPublicInputs<F, C, D>,
-    vd: &VerifierOnlyCircuitData<C, D>,
-    cd: &CommonCircuitData<F, D>,
-) -> Result<()>
-where
-    [(); C::Hasher::HASH_SIZE]:,
-{
-    let proof_bytes = proof.to_bytes();
-    info!("Proof length: {} bytes", proof_bytes.len());
-    let proof_from_bytes = ProofWithPublicInputs::from_bytes(proof_bytes, cd)?;
-    assert_eq!(proof, &proof_from_bytes);
-
-    let now = std::time::Instant::now();
-    let compressed_proof = proof.clone().compress(&vd.circuit_digest, cd)?;
-    let decompressed_compressed_proof = compressed_proof
-        .clone()
-        .decompress(&vd.circuit_digest, cd)?;
-    info!("{:.4}s to compress proof", now.elapsed().as_secs_f64());
-    assert_eq!(proof, &decompressed_compressed_proof);
-
-    let compressed_proof_bytes = compressed_proof.to_bytes();
-    info!(
-        "Compressed proof length: {} bytes",
-        compressed_proof_bytes.len()
-    );
-    let compressed_proof_from_bytes =
-        CompressedProofWithPublicInputs::from_bytes(compressed_proof_bytes, cd)?;
-    assert_eq!(compressed_proof, compressed_proof_from_bytes);
-
-    Ok(())
-}
 
 #[derive(Parser)]
 struct Cli {
@@ -243,6 +41,55 @@ pub fn decode_hex(s: &String) -> Result<Vec<u8>, ParseIntError> {
         .collect()
 }
 
+fn benchmark_multiple() -> Result<()> {
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
+
+    prove_ed25519_multiple::<F, C, D>(
+        SAMPLE_MSG1.as_bytes(),
+        SAMPLE_SIG1.as_slice(),
+        SAMPLE_PK1.as_slice(),
+    )
+    .expect("prove error 1");
+
+    Ok(())
+}
+
+fn prove_ed25519_multiple<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    msg: &[u8],
+    sigv: &[u8],
+    pkv: &[u8],
+) -> Result<()>
+where
+    [(); C::Hasher::HASH_SIZE]:,
+{
+    let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::wide_ecc_config());
+    let mut pw = PartialWitness::new();
+    let repeat_times = 2;
+    for _ in 0..repeat_times {
+        let targets = make_verify_circuits(&mut builder, msg.len());
+        fill_circuits::<F, D>(&mut pw, msg, sigv, pkv, &targets);    
+    }
+
+    println!(
+        "Constructing inner proof with {} gates",
+        builder.num_gates()
+    );
+    let data = builder.build::<C>();
+
+    let timing = TimingTree::new("prove", Level::Info);
+    let proof = data.prove(pw).unwrap();
+    timing.print();
+
+    let timing = TimingTree::new("verify", Level::Info);
+    data.verify(proof.clone()).expect("verify error");
+    timing.print();
+
+    Ok(())
+}
+
+
 fn main() -> Result<()> {
     // Initialize logging
     let mut builder = env_logger::Builder::from_default_env();
@@ -250,66 +97,5 @@ fn main() -> Result<()> {
     builder.filter_level(LevelFilter::Info);
     builder.try_init()?;
 
-    let args = Cli::parse();
-    if args.benchmark == 1 {
-        // Run the benchmark
-        benchmark()
-    } else {
-        if args.sig.is_none() || args.pk.is_none() || args.msg.is_none() {
-            println!("The required arguments were not provided: --msg MSG_IN_HEX  --pk PUBLIC_KEY_IN_HEX  --sig SIGNATURE_IN_HEX");
-            return Ok(());
-        }
-
-        const D: usize = 2;
-        type C = PoseidonGoldilocksConfig;
-        type F = <C as GenericConfig<D>>::F;
-        let eddsa_proof = prove_ed25519::<F, C, D>(
-            decode_hex(&args.msg.unwrap())?.as_slice(),
-            decode_hex(&args.sig.unwrap())?.as_slice(),
-            decode_hex(&args.pk.unwrap())?.as_slice(),
-        )?;
-        println!("Num public inputs: {}", eddsa_proof.2.num_public_inputs);
-
-        // TODO: remove this double recursion will cause leaf proving error, why?
-        let standard_config = CircuitConfig::standard_recursion_config();
-        let (inner_proof, inner_vd, inner_cd) =
-            recursive_proof::<F, C, C, D>(&eddsa_proof, None, &standard_config, None)?;
-        println!("Num public inputs: {}", inner_cd.num_public_inputs);
-
-        // recursively prove in a leaf
-        let mut common_data = common_data_for_recursion::<GoldilocksField, C, D>();
-        let mut builder = CircuitBuilder::<F, D>::new(standard_config.clone());
-        let leaf_targets = builder.tree_recursion_leaf::<C>(inner_cd, &mut common_data)?;
-        let data = builder.build::<C>();
-        let leaf_vd = &data.verifier_only;
-        let mut pw = PartialWitness::new();
-        let leaf_data = TreeRecursionLeafData {
-            inner_proof: &inner_proof,
-            inner_verifier_data: &inner_vd,
-            verifier_data: leaf_vd,
-        };
-        set_tree_recursion_leaf_data_target(&mut pw, &leaf_targets, &leaf_data)?;
-        let leaf_proof = data.prove(pw)?;
-        check_tree_proof_verifier_data(&leaf_proof, leaf_vd, &common_data)
-            .expect("Leaf public inputs do not match its verifier data");
-        data.verify(leaf_proof.clone()).expect("verify error");
-        println!("Num public inputs: {}", common_data.num_public_inputs);
-
-        let proof_bytes = leaf_proof.to_bytes();
-        info!("Export proof: {} bytes", proof_bytes.len());
-
-        println!(
-            "Exporting root proof: {}",
-            args.output_path
-                .clone()
-                .into_os_string()
-                .into_string()
-                .unwrap()
-        );
-        let mut file = File::create(args.output_path)?;
-        file.write_all(&*proof_bytes)
-            .expect("Leaf proof file write err");
-
-        Ok(())
-    }
+    benchmark_multiple()
 }
