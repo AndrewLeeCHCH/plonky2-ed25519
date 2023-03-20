@@ -66,7 +66,7 @@ where
 {
     let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::wide_ecc_config());
     let mut pw = PartialWitness::new();
-    let repeat_times = 1;
+    let repeat_times = 8;
     for _ in 0..repeat_times {
         let targets = make_verify_circuits(&mut builder, msg.len());
         fill_circuits::<F, D>(&mut pw, msg, sigv, pkv, &targets);    
